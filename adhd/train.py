@@ -16,11 +16,10 @@ from layers import Transformer
 import numpy as np
 import optax
 
-param_with_axes = nn_partitioning.param_with_axes
-with_sharding_constraint = nn_partitioning.with_sharding_constraint
-scan_with_axes = nn_partitioning.scan_with_axes
-remat = nn_partitioning.remat
-ScanIn = nn_partitioning.ScanIn
+
+logical_to_mesh_axes = nn_partitioning.logical_to_mesh_axes
+logical_to_mesh = nn_partitioning.logical_to_mesh
+
 
 # Type annotations
 Array = jnp.ndarray
@@ -39,7 +38,8 @@ NdInitializer = Callable[
 # Data Iterators
 # -----------------------------------------------------------------------------
 
-# A generator shoud return (input, target, segments, positions)
+# A generator should return (input, target, segments, positions)
+# TODO: not correct, grab _old_ t5x def. that handles packing correctly
 def right_shift(arr):
   result = np.zeros_like(arr)
   result[:, 1:] = arr[:, :-1]

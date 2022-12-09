@@ -18,10 +18,9 @@ import numpy as np
 
 from .config import T5Config
 
-param_with_axes = nn_partitioning.param_with_axes
 with_sharding_constraint = nn_partitioning.with_sharding_constraint
-scan_with_axes = nn_partitioning.scan_with_axes
-remat = nn_partitioning.remat
+with_logical_partitioning = nn_partitioning.with_logical_partitioning
+withLP = nn_partitioning.with_logical_partitioning
 ScanIn = nn_partitioning.ScanIn
 
 
@@ -181,14 +180,13 @@ class DenseGeneral(nn.Module):
     kernel_shape = tuple([inputs.shape[ax] for ax in axis]) + features
     kernel_in_axis = np.arange(len(axis))
     kernel_out_axis = np.arange(len(axis), len(axis) + len(features))
-    kernel = param_with_axes(
+    kernel = self.param(
         'kernel',
-        self.kernel_init,
+        withLP(self.kernel_init, self.kernel_axes)
         kernel_shape,
         jnp.float32,
         kernel_in_axis,
-        kernel_out_axis,
-        axes=self.kernel_axes)
+        kernel_out_axis)
     kernel = jnp.asarray(kernel, self.dtype)
 
     contract_ind = tuple(range(0, len(axis)))
@@ -476,8 +474,8 @@ class LayerNorm(nn.Module):
     features = x.shape[-1]
     mean2 = jnp.mean(lax.square(x), axis=-1, keepdims=True)
     y = jnp.asarray(x * lax.rsqrt(mean2 + self.epsilon), self.dtype)
-    scale = param_with_axes(
-        'scale', self.scale_init, (features,), jnp.float32, axes=('embed',))
+    scale = self.param(
+        'scale', withLP(self.scale_init, ('embed',)), (features,), jnp.float32)
 
     scale = jnp.asarray(scale, self.dtype)
     return y * scale
@@ -508,11 +506,11 @@ class Embed(nn.Module):
   embedding: Array = dataclasses.field(init=False)
 
   def setup(self):
-    self.embedding = param_with_axes(
+    self.embedding = self.param(
         'embedding',
-        self.embedding_init, (self.num_embeddings, self.features),
-        jnp.float32,
-        axes=('vocab', 'embed'))
+        withLP(self.embedding_init, ('vocab', 'embed')),
+        (self.num_embeddings, self.features),
+        jnp.float32)
 
   def __call__(self, inputs: Array) -> Array:
     """Embeds the inputs along the last dimension.
@@ -643,11 +641,11 @@ class RelativePositionBiases(nn.Module):
         bidirectional=bidirectional,
         num_buckets=self.num_buckets,
         max_distance=self.max_distance)
-    relative_attention_bias = param_with_axes(
+    relative_attention_bias = self.param(
         'rel_embedding',
-        self.embedding_init, (self.num_heads, self.num_buckets),
-        jnp.float32,
-        axes=('heads', 'relpos_buckets'))
+        withLP(self.embedding_init, ('heads', 'relpos_buckets')),
+        (self.num_heads, self.num_buckets),
+        jnp.float32)
 
     relative_attention_bias = jnp.asarray(relative_attention_bias, self.dtype)
     # Instead of using a slow gather, we create a leading-dimension one-hot
@@ -989,7 +987,7 @@ class Decoder(nn.Module):
         policy = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
       else:
         policy = None
-      BlockLayer = remat(  # pylint: disable=invalid-name
+      BlockLayer = nn.remat(  # pylint: disable=invalid-name
           BlockLayer,
           prevent_cse=not cfg.scan_layers,
           policy=policy,
@@ -999,7 +997,7 @@ class Decoder(nn.Module):
       params_spec = (
           cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis))
       cache_spec = 0
-      y, _ = scan_with_axes(
+      y, _ = nn.scan(
           BlockLayer,
           variable_axes={
               'params': params_spec,
@@ -1012,7 +1010,7 @@ class Decoder(nn.Module):
           in_axes=(nn.broadcast, nn.broadcast, nn.broadcast,
                    nn.broadcast, nn.broadcast),
           length=cfg.num_decoder_layers,
-          axis_name='layers')(
+          metadata_params={nn.PARTITION_NAME: 'layers'})(
               config=cfg,
               name='decoder')(y, decoder_mask,
                               deterministic, decode, max_decode_length)
