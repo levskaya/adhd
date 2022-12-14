@@ -16,11 +16,9 @@ import jax.numpy as jnp
 
 import numpy as np
 
-from .config import T5Config
+from config import T5Config
 
-with_sharding_constraint = nn_partitioning.with_sharding_constraint
-with_logical_partitioning = nn_partitioning.with_logical_partitioning
-withLP = nn_partitioning.with_logical_partitioning
+withLP = nn.with_logical_partitioning
 ScanIn = nn_partitioning.ScanIn
 
 
@@ -182,7 +180,7 @@ class DenseGeneral(nn.Module):
     kernel_out_axis = np.arange(len(axis), len(axis) + len(features))
     kernel = self.param(
         'kernel',
-        withLP(self.kernel_init, self.kernel_axes)
+        withLP(self.kernel_init, self.kernel_axes),
         kernel_shape,
         jnp.float32,
         kernel_in_axis,
@@ -284,9 +282,9 @@ class MultiHeadDotProductAttention(nn.Module):
     key = projection(kernel_init=self.kernel_init, name='key')(inputs_kv)
     value = projection(kernel_init=self.kernel_init, name='value')(inputs_kv)
 
-    query = with_sharding_constraint(query, ('batch', 'length', 'heads', 'kv'))
-    key = with_sharding_constraint(key, ('batch', 'length', 'heads', 'kv'))
-    value = with_sharding_constraint(value, ('batch', 'length', 'heads', 'kv'))
+    query = nn.with_logical_constraint(query, ('batch', 'length', 'heads', 'kv'))
+    key = nn.with_logical_constraint(key, ('batch', 'length', 'heads', 'kv'))
+    value = nn.with_logical_constraint(value, ('batch', 'length', 'heads', 'kv'))
 
     if decode:
       # Detect if we're initializing by absence of existing cache data.
@@ -445,7 +443,7 @@ class MlpBlock(nn.Module):
     x = nn.Dropout(
         rate=self.intermediate_dropout_rate, broadcast_dims=(-2,))(
             x, deterministic=deterministic)  # Broadcast along length.
-    x = with_sharding_constraint(x, ('batch', 'length', 'mlp'))
+    x = nn.with_logical_constraint(x, ('batch', 'length', 'mlp'))
     output = DenseGeneral(
         inputs.shape[-1],
         dtype=self.dtype,
@@ -532,7 +530,7 @@ class Embed(nn.Module):
       output = jnp.dot(one_hot, jnp.asarray(self.embedding, self.dtype))
     else:
       output = jnp.asarray(self.embedding, self.dtype)[inputs]
-      output = with_sharding_constraint(output, ('batch', 'length', 'embed'))
+      output = nn.with_logical_constraint(output, ('batch', 'length', 'embed'))
     return output
 
   def attend(self, query: Array) -> Array:
@@ -907,13 +905,13 @@ class DecoderLayer(nn.Module):
                                                         'uniform'),
         name='relpos_bias')(l, l, False)
 
-    inputs = with_sharding_constraint(inputs, ('batch', 'length', 'embed'))
+    inputs = nn.with_logical_constraint(inputs, ('batch', 'length', 'embed'))
 
     # inputs: embedded inputs to the decoder with shape [batch, length, emb_dim]
     x = LayerNorm(
         dtype=cfg.dtype, name='pre_self_attention_layer_norm')(
             inputs)
-    x = with_sharding_constraint(x, ('batch', 'length', 'embed'))
+    x = nn.with_logical_constraint(x, ('batch', 'length', 'embed'))
 
     # Self-attention block
     x = MultiHeadDotProductAttention(
@@ -932,11 +930,11 @@ class DecoderLayer(nn.Module):
         rate=cfg.dropout_rate, broadcast_dims=(-2,))(
             x, deterministic=deterministic)
     x = x + inputs
-    x = with_sharding_constraint(x, ('batch', 'length', 'embed'))
+    x = nn.with_logical_constraint(x, ('batch', 'length', 'embed'))
 
     # MLP block.
     z = LayerNorm(dtype=cfg.dtype, name='pre_mlp_layer_norm')(x)
-    z = with_sharding_constraint(z, ('batch', 'length', 'embed'))
+    z = nn.with_logical_constraint(z, ('batch', 'length', 'embed'))
     z = MlpBlock(
         intermediate_dim=cfg.mlp_dim,
         activations=cfg.mlp_activations,
@@ -948,7 +946,7 @@ class DecoderLayer(nn.Module):
         rate=cfg.dropout_rate, broadcast_dims=(-2,))(
             z, deterministic=deterministic)
     z = z + x
-    z = with_sharding_constraint(z, ('batch', 'length', 'embed'))
+    z = nn.with_logical_constraint(z, ('batch', 'length', 'embed'))
 
     if cfg.scan_layers:
       return z, None

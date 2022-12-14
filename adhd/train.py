@@ -118,7 +118,7 @@ def train_step(state, apply_args, model, dropout_rng):
   return new_state, metrics, rng2
 
 
-def train_loop(config, steps, data_gen, state=None, 
+def train_loop(config, steps, data_gen, state=None,
                ckpt_path='~/flaxformer/lm1b'):
   nextrng = jax.random.PRNGKey(0)
   model = Transformer(config)
