@@ -8,7 +8,7 @@ import ml_collections
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-import tokenizer
+from adhd import tokenizer
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 Features = Dict[str, tf.Tensor]
@@ -38,9 +38,7 @@ def get_raw_dataset(dataset_builder: tfds.core.DatasetBuilder,
     Dataset with source and target language features mapped to 'inputs' and
     'targets'.
   """
-  num_examples = dataset_builder.info.splits[split].num_examples
-  per_host_split = deterministic_data.get_read_instruction_for_host(
-      split, num_examples, drop_remainder=False)
+  per_host_split = tfds.split_for_jax_process(split, drop_remainder=False)
   ds = dataset_builder.as_dataset(split=per_host_split, shuffle_files=False)
   ds = ds.map(
       NormalizeFeatureNamesOp(dataset_builder.info),

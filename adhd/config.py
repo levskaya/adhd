@@ -1,6 +1,6 @@
 """Config for training."""
 
-from typing import Any, Sequence
+from typing import Any, Sequence, Tuple
 from flax import struct
 import jax.numpy as jnp
 
@@ -15,22 +15,24 @@ class T5Config:
   num_heads: int = 8
   head_dim: int = 16
   mlp_dim: int = 512
-  num_decoder_layers: int = 2
-
-  # Activation functions are retrieved from Flax.
+  num_decoder_layers: int = 6
+  # activation functions are .
   mlp_activations: Sequence[str] = ('relu',)
   dropout_rate: float = 0
   # If `True`, the embedding weights are used in the decoder output layer.
-  logits_via_embedding: bool = True
+  logits_via_embedding: bool = True  # NOTE: this is True just for testing.
   # minimal, full, or none
   remat_policy: str = 'none'
-
-  # Parallelism
   scan_layers: bool = False
   param_scan_axis: int = 1
 
+  # Parallelism
+  mesh_shape: Tuple[int] = (8,)
+  mesh_axes: Tuple[str] = ('data',)
+  logical_axis_rules: Sequence = ( ('batch', 'data'), )
+
   # Dataset
-  vocab_size: int = 10000
+  vocab_size: int = 30000
   dataset_name: str = 'lm1b'
   eval_dataset_name: str = 'lm1b'
   eval_split: str = 'test'
@@ -38,17 +40,19 @@ class T5Config:
   eval_per_device_batch_size: int = 0
   max_corpus_chars: int = 10**7  # for tokenization
 
-  # Copied from lm1b example - no idea why their lengths are different
   # Maximum length cutoff for training examples.
   max_target_length: int = 128
-  # Maximum length cutoff for eval examples.
+  # Maximum length cutoff for held-out evaluation examples.
   max_eval_target_length: int = 512
   # Maximum length cutoff for predicted tokens.
   max_predict_length: int = 50
+  # Sampling temperature for language model inference.
+  sampling_temperature: float = 0.6
+  # Top k cutoff for logit sampling. If 0 then no top-k cutoff is used.
+  sampling_top_k: int = 20
 
   # Training loop
   learning_rate: float = 1e-3
   warmup_steps: int = 1000
-
-  save_checkpoints: bool = True
-  restore_checkpoints: bool = True
+  save_checkpoints: bool = False
+  restore_checkpoints: bool = False

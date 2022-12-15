@@ -16,11 +16,11 @@ import jax.numpy as jnp
 
 import numpy as np
 
-from config import T5Config
 
 withLP = nn.with_logical_partitioning
 ScanIn = nn_partitioning.ScanIn
 
+Config = Any
 
 # Type annotations
 Array = jnp.ndarray
@@ -883,7 +883,7 @@ def make_decoder_mask(decoder_target_tokens: Array,
 
 class DecoderLayer(nn.Module):
   """Transformer decoder layer that attends to the encoder."""
-  config: T5Config
+  config: Config
 
   @nn.compact
   def __call__(self,
@@ -957,7 +957,7 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
-  config: T5Config
+  config: Config
   shared_embedding: nn.Module
 
   @nn.compact
@@ -1046,7 +1046,7 @@ class Decoder(nn.Module):
 
 class Transformer(nn.Module):
   """An decoder-only Transformer model."""
-  config: T5Config
+  config: Config
 
   def setup(self):
     cfg = self.config

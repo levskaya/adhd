@@ -112,7 +112,12 @@ def load_or_train_tokenizer(dataset: tf.data.Dataset,
                             data_keys: Tuple[str, str] = ('inputs', 'targets')):
   """Loads the tokenizer at `vocab_path` or trains a one from `dataset`."""
   try:
-    return _load_sentencepiece_tokenizer(vocab_path)
+    sp_tokenizer = _load_sentencepiece_tokenizer(vocab_path)
+    sp_size = int(sp_tokenizer.vocab_size())
+    if sp_size != vocab_size:
+      raise ValueError(f'Existing sentencepiece vocabulary size {sp_size} '
+                       f'does not match specified vocab size {vocab_size}.')
+    return sp_tokenizer
   except tf.errors.NotFoundError:
     logging.info('SentencePiece vocab not found, building one from data.')
     vocab_path = _train_sentencepiece(

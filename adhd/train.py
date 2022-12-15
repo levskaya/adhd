@@ -4,24 +4,32 @@ import functools
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
 
 from absl import app
-from config import T5Config
+import flax
+from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import checkpoints
 from flax.training import train_state
-from input_pipeline import get_datasets
 import jax
 import jax.numpy as jnp
-from layers import Transformer
-
+from jax import lax
+from jax import random
 import numpy as np
 import optax
 
+from jax.experimental.pjit import pjit
+from jax.experimental.pjit import PartitionSpec as P
+from jax.experimental import mesh_utils
+from jax.experimental.maps import Mesh
 
-logical_to_mesh_axes = nn_partitioning.logical_to_mesh_axes
-logical_to_mesh = nn_partitioning.logical_to_mesh
+from layers import Transformer
+from config import T5Config
+from input_pipeline import get_datasets
+import temperature_sampler
 
+# -----------------------------------------------------------------------------
+# Types
+# -----------------------------------------------------------------------------
 
-# Type annotations
 Array = jnp.ndarray
 DType = jnp.dtype
 PRNGKey = jnp.ndarray
@@ -35,41 +43,58 @@ NdInitializer = Callable[
 
 
 # -----------------------------------------------------------------------------
+# Flax TrainState with mutable variables field
+# -----------------------------------------------------------------------------
+# TODO(levskaya): upstream this field to the main TrainState.
+# ...is this even needed here?  probably not for kv-cache.
+class MutableTrainState(train_state.TrainState):
+    mutables: Optional[flax.core.FrozenDict[str, Any]]
+
+
+# -----------------------------------------------------------------------------
 # Data Iterators
 # -----------------------------------------------------------------------------
 
 # A generator should return (input, target, segments, positions)
-# TODO: not correct, grab _old_ t5x def. that handles packing correctly
-def right_shift(arr):
-  result = np.zeros_like(arr)
-  result[:, 1:] = arr[:, :-1]
-  return result
+def shift_right(x, axis=1):
+  """Shift the input to the right by padding and slicing on axis."""
+  pad_widths = [(0, 0)] * len(x.shape)
+  pad_widths[axis] = (1, 0)
+  slices = [slice(None),] * x.ndim
+  slices[axis] = slice(0, -1)
+  padded = np.pad(
+      x, pad_widths, mode='constant', constant_values=x.dtype.type(0))
+  return padded[tuple(slices)]
 
+def shift_inputs(x, segment_ids=None, axis=1):
+  """Shift inputs and replace EOS by 0 for packed inputs."""
+  shifted = shift_right(x, axis=axis)
+  # For packed targets, the first shifted token of a new sequence is made
+  # 0, rather than being the EOS token for the last sequence.
+  if segment_ids is not None:
+    shifted *= (segment_ids == shift_right(segment_ids, axis=axis))
+  return shifted
 
-def make_lm1b_gen(train_ds):
+def data_generator(train_ds):
   train_iter = iter(train_ds)
   while True:
-    step_data = jax.tree_util.tree_map(np.asarray, next(train_iter))
-    tokens = step_data['inputs']
-    shifted = right_shift(tokens)
-    yield shifted, tokens, step_data['inputs_segmentation'], step_data[
-        'inputs_position']
+    data = jax.tree_util.tree_map(np.asarray, next(train_iter))
+    yield (
+      shift_inputs(data['inputs'], data['inputs_segmentation']),
+      data['inputs'],
+      data['inputs_segmentation'],
+      data['inputs_position']
+    )
 
 
 # -----------------------------------------------------------------------------
 # Training Loop
 # -----------------------------------------------------------------------------
 
-
 # learning rate scheduling
-def rsqrt_schedule(
-    init_value: float,
-    shift: int = 0,
-):
-
+def rsqrt_schedule(init_value: float, shift: int = 0):
   def schedule(count):
     return init_value * (count + shift)**-.5 * shift**.5
-
   return schedule
 
 
@@ -77,37 +102,50 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
   """Creates a rsqrt schedule with linear warmup."""
   return optax.join_schedules([
       optax.linear_schedule(
-          init_value=0, end_value=learning_rate, transition_steps=warmup_steps),
-      rsqrt_schedule(init_value=learning_rate, shift=warmup_steps),
-  ],
-                              boundaries=[warmup_steps])
+          init_value=0,
+          end_value=learning_rate,
+          transition_steps=warmup_steps
+          ),
+      rsqrt_schedule(
+        init_value=learning_rate,
+        shift=warmup_steps),
+    ],
+    boundaries=[warmup_steps])
 
 
-# @functools.partial(
-#     pjit,
-#     in_axis_resources=(param_sharding, (pspec, pspec, pspec, pspec), None, None,
-#                        None),
-#     out_axis_resources=(None, pspec),
-#     static_argnums=(2, 4))
-@functools.partial(jax.jit, static_argnums=(2,))
-def train_step(state, apply_args, model, dropout_rng):
+def init_train_state(model, tx, config, key):
+  input_shape = (
+      len(jax.devices()) * config.per_device_batch_size,
+      config.max_target_length
+  )
+  model_vars = model.init({'params': key, 'dropout': key},
+                          jnp.ones(input_shape),
+                          jnp.ones(input_shape))
+  state = MutableTrainState.create(
+      apply_fn=model.apply,
+      params=model_vars['params'],
+      tx=tx,
+      mutables=None)
+  return state
+
+
+def train_step(model, state, apply_args, dropout_rng):
   inputs, targets, segments, positions = apply_args
   rng1, rng2 = jax.random.split(dropout_rng)
 
   def loss_fn(params):
-    # with mesh, nn_partitioning.axis_rules(logical_axis_rules):
     logits = model.apply({'params': params},
                          inputs,
                          targets,
                          segments,
                          positions,
                          rngs={'dropout': rng1})
-    entropy = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    # TODO: is optax xent as good as custom T5X one?
+    xent = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     # Mask out paddings at the end of each example.
-    # jax.debug.print(f'{entropy.shape}, {segments.shape}')
-    entropy = entropy * (segments != 0)
-    # TODO: mask out the prompt if training example has one (lm1b doesn't)
-    return jnp.sum(entropy), logits
+    xent = xent * (segments != 0)
+    # TODO: mask out the prompt if training prefix-LM
+    return jnp.sum(xent), logits
 
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
   (loss, _), grads = grad_fn(state.params)
@@ -118,33 +156,64 @@ def train_step(state, apply_args, model, dropout_rng):
   return new_state, metrics, rng2
 
 
-def train_loop(config, steps, data_gen, state=None,
-               ckpt_path='~/flaxformer/lm1b'):
-  nextrng = jax.random.PRNGKey(0)
-  model = Transformer(config)
-  # with mesh, nn_partitioning.axis_rules(logical_axis_rules):
-  #   vars = p_init({'params': jax.random.PRNGKey(0), 'dropout': jax.random.PRNGKey(0)},
-  #                 jnp.ones((16, 128)), jnp.ones((16, 128)))
-  vars = model.init({
-      'params': jax.random.PRNGKey(0),
-      'dropout': jax.random.PRNGKey(0)
-  }, jnp.ones((16, 128)), jnp.ones((16, 128)))
-  tx = optax.adam(
-      create_learning_rate_schedule(
-          learning_rate=config.learning_rate, warmup_steps=config.warmup_steps))
+def train_loop(
+  config,
+  steps,
+  data_gen,
+  state=None,
+  ckpt_path='~/flaxformer/lm1b'):
 
-  state = train_state.TrainState.create(
-      apply_fn=model.apply,
-      params=vars['params'],
-      tx=tx,
-  )
+  # Initial PRNG Keys
+  init_rng, nextrng = random.split(random.PRNGKey(0), 2)
+
+  # Model and Optimizer definition
+  model = Transformer(config)
+  tx = optax.adam(
+    create_learning_rate_schedule(
+        learning_rate=config.learning_rate,
+        warmup_steps=config.warmup_steps))
+
+  # Mesh definition
+  mesh = Mesh(mesh_utils.create_device_mesh(config.mesh_shape), config.mesh_axes)
+
+  # Abstract initialization
+  init_fn = functools.partial(init_train_state, model, tx, config)
+  abstract_state = jax.eval_shape(init_fn, init_rng)
+  state_logical_annotations = nn.get_partition_spec(abstract_state)
+
+  # Initialization
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
+      state = pjit(
+          init_fn,
+          in_axis_resources=None,
+          out_axis_resources=state_mesh_annotations
+      )(init_rng)
+
+  # Checkpoint Restoration
+  # TODO: we shouldn't run full init compilation when we need to load ckpt.
   if config.restore_checkpoints:
     state = checkpoints.restore_checkpoint(ckpt_path, state)
 
+  data_pspec = nn.logical_to_mesh(P('batch'))
+
+  p_train_step = pjit(
+    train_step,
+    in_axis_resources=(state_mesh_annotations,
+                       data_pspec,
+                       None),
+    out_axis_resources=(state_mesh_annotations, None, None),
+    static_argnums=(0,))
+
+
+  # Main Loop
+  # ---------------------------------------------------------------------------
+
   for step in np.arange(steps):
     # shifted_input, targets, segments, positions = next(data_gen)
-    apply_args = next(data_gen)
-    state, metrics, nextrng = train_step(state, apply_args, model, nextrng)
+    example_batch = next(data_gen)
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      state, metrics, nextrng = p_train_step(model, state, example_batch, nextrng)
     if step % 400 == 0:
       print(step, metrics)
     if step % 2000 == 0:
@@ -222,10 +291,10 @@ def main(argv: Sequence[str]) -> None:
 
   config = T5Config()
 
-  # Load lm1b data
+  # Load data
   train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
       n_devices=jax.local_device_count(), config=config, vocab_path=None)
-  lm1b_gen = make_lm1b_gen(train_ds)
+  lm1b_gen = data_generator(train_ds)
 
   state, model = train_loop(config, 1000, lm1b_gen)
 
