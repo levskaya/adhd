@@ -40,19 +40,27 @@ class T5Config:
   eval_per_device_batch_size: int = 0
   max_corpus_chars: int = 10**7  # for tokenization
 
+  # Training loop
+  steps: int = 20_000
+  log_period: int = 500
+  save_period: int = 2000
+  learning_rate: float = 1e-3
+  warmup_steps: int = 1000
+  save_checkpoints: bool = False
+  restore_checkpoints: bool = False
+
   # Maximum length cutoff for training examples.
   max_target_length: int = 128
   # Maximum length cutoff for held-out evaluation examples.
   max_eval_target_length: int = 512
+
   # Maximum length cutoff for predicted tokens.
   max_predict_length: int = 50
   # Sampling temperature for language model inference.
   sampling_temperature: float = 0.6
   # Top k cutoff for logit sampling. If 0 then no top-k cutoff is used.
   sampling_top_k: int = 20
+  eos_id: int = 2  # sentencepiece default
+  # Prompt for language model sampling.
+  prompt: str = "I love to "
 
-  # Training loop
-  learning_rate: float = 1e-3
-  warmup_steps: int = 1000
-  save_checkpoints: bool = False
-  restore_checkpoints: bool = False

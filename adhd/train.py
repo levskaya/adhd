@@ -46,7 +46,6 @@ NdInitializer = Callable[
 # Flax TrainState with mutable variables field
 # -----------------------------------------------------------------------------
 # TODO(levskaya): upstream this field to the main TrainState.
-# ...is this even needed here?  probably not for kv-cache.
 class MutableTrainState(train_state.TrainState):
     mutables: Optional[flax.core.FrozenDict[str, Any]]
 
@@ -87,8 +86,7 @@ def data_generator(train_ds):
     )
 
 
-# -----------------------------------------------------------------------------
-# Training Loop
+# Helpers
 # -----------------------------------------------------------------------------
 
 # learning rate scheduling
@@ -113,7 +111,14 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
     boundaries=[warmup_steps])
 
 
+# -----------------------------------------------------------------------------
+# Top-level Functions
+# -----------------------------------------------------------------------------
+
 def init_train_state(model, tx, config, key):
+  # We pass in "static" objects like model, tx, config as JAX compares them by
+  # object hash, and instantiating them inside causes pjit top-level annotations
+  # to fail to match as pytree prefixes if we re-instantiate.
   input_shape = (
       len(jax.devices()) * config.per_device_batch_size,
       config.max_target_length
@@ -156,15 +161,76 @@ def train_step(model, state, apply_args, dropout_rng):
   return new_state, metrics, rng2
 
 
+def predict_step(inputs,
+                 state,
+                 rngkey,
+                 model,
+                 config):
+  """Predict language model on a batch."""
+  # NOTE: wtf are we adding inputs.shape[2:] here?  it's almost always empty??
+  target_shape = (inputs.shape[0], config.max_predict_length) + inputs.shape[2:]
+
+  initial_variables = model.init(
+    jax.random.PRNGKey(0),
+    jnp.ones(target_shape, config.dtype),
+    None,
+    enable_dropout=False,
+    decode=True,
+    max_decode_length=config.max_predict_length
+  )
+  cache = initial_variables["cache"]
+
+  def tokens_ids_to_logits(flat_ids, flat_cache):
+    """Token slice to logits from decoder model."""
+    # --> [batch * beam, 1, vocab]
+    flat_logits, new_vars = model.apply(
+        {
+            "params": state.params,
+            "cache": flat_cache
+        },
+        flat_ids,
+        None,
+        enable_dropout=False,
+        decode=True,
+        max_decode_length=config.max_predict_length,
+        mutable=["cache"])
+    new_flat_cache = new_vars["cache"]
+    # Remove singleton sequence-length dimension:
+    # [batch, 1, vocab] --> [batch, vocab]
+    flat_logits = flat_logits.squeeze(axis=1)
+    return flat_logits, new_flat_cache
+
+  # Using the above-defined single-step decoder function, run a
+  # search over possible sequences given input encoding.
+  seqs = temperature_sampler.temperature_sample(
+      inputs,
+      cache,
+      tokens_ids_to_logits,
+      rngkey,
+      temperature=config.sampling_temperature,
+      topk=config.sampling_top_k,
+      eos_token=config.eos_id)
+
+  return seqs
+
+
+# Train Loop
+# ---------------------------------------------------------------------------
+
 def train_loop(
   config,
-  steps,
-  data_gen,
   state=None,
   ckpt_path='~/flaxformer/lm1b'):
 
   # Initial PRNG Keys
   init_rng, nextrng = random.split(random.PRNGKey(0), 2)
+
+  # Set up datasets.
+  train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
+      n_devices=jax.local_device_count(),
+      config=config,
+      vocab_path=None)
+  data_gen = data_generator(train_ds)
 
   # Model and Optimizer definition
   model = Transformer(config)
@@ -205,18 +271,48 @@ def train_loop(
     out_axis_resources=(state_mesh_annotations, None, None),
     static_argnums=(0,))
 
+  # TODO: add held-out eval step.
+
+  p_predict_step = pjit(
+      functools.partial(predict_step, model=model, config=config),
+      in_axis_resources=(data_pspec,
+                        state_mesh_annotations,
+                        None),
+      out_axis_resources=None
+  )
+
+  # Prediction helpers.
+
+  def decode_tokens(toks):
+    valid_toks = toks[:np.argmax(toks == config.eos_id) + 1].astype(np.int32)
+    return sp_tokenizer.detokenize(valid_toks).numpy().decode("utf-8")
+
+  def encode_strings(strs, max_len):
+    tokenized_batch = np.zeros((len(strs), max_len), np.int32)
+    for i, s in enumerate(strs):
+      toks = sp_tokenizer.tokenize(s).numpy()
+      # Remove EOS token in prompt.
+      tokenized_batch[i, :toks.shape[0]-1] = toks[:-1]
+    return tokenized_batch
+
+  tokenized_prompts = encode_strings(
+      [config.prompt], config.max_predict_length)
 
   # Main Loop
-  # ---------------------------------------------------------------------------
 
-  for step in np.arange(steps):
-    # shifted_input, targets, segments, positions = next(data_gen)
+  for step in np.arange(config.steps):
+
     example_batch = next(data_gen)
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       state, metrics, nextrng = p_train_step(model, state, example_batch, nextrng)
-    if step % 400 == 0:
+
+    if step % config.log_period == 0:
       print(step, metrics)
-    if step % 2000 == 0:
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        seqs = p_predict_step(tokenized_prompts, state, nextrng)
+        print(decode_tokens(seqs[0]))
+
+    if step % config.save_period == 0:
       if config.save_checkpoints and step != 0:
         checkpoints.save_checkpoint(
             ckpt_path, state, step=step, keep=1000, overwrite=True)
@@ -224,79 +320,12 @@ def train_loop(
   return state, model
 
 
-# Decodeing data without KV Cache
-def decode_without_kvc(state, model, shifted, data, config):
-  shifted_in = shifted + 0.0
-  shifted_in[:, 17:] = 0
-  for i in range(15):
-    output = model.apply({'params': state.params},
-                         shifted_in,
-                         data,
-                         rngs={'dropout': jax.random.PRNGKey(0)})
-    updates = jnp.argmax(jax.nn.softmax(output), axis=2)
-    shifted_in[:, 17 + i] = updates[:, 16 + i]  # greedy sampling
-
-  print(shifted_in.shape)
-  return shifted_in[0]
-
-
-# Decoding with KV cache
-def decode_with_kvc(state, model, shifted, data, config):
-  output, updated_vars = model.apply({'params': state.params},
-                                     data,
-                                     data,
-                                     decode=True,
-                                     max_decode_length=config.max_target_length,
-                                     rngs={'dropout': jax.random.PRNGKey(0)},
-                                     mutable=('cache',))
-
-  cache = updated_vars['cache']
-  cache = jax.tree_map(jnp.zeros_like, cache)
-  jax.tree_map(jnp.shape, cache)
-
-  print(data[0])
-  print(shifted[0])
-  data_in = shifted + 0.0
-  data_in[:, 17:] = 0
-
-  # sampling
-  for i in range(31):
-    output, updated_vars = model.apply(
-        {
-            'params': state.params,
-            'cache': cache
-        },
-        data_in[:, i:i + 1],
-        data[:, i:i + 1],
-        rngs={},
-        decode=True,
-        max_decode_length=config.max_target_length,
-        mutable=('cache',))
-    if i == 0:
-      print(data_in[:, i:i + 1].shape)
-      print(output.shape)
-    updates = jnp.argmax(jax.nn.softmax(output), axis=2)
-    # print(i, data_in[0, i:i+1], updates[0])
-    cache = updated_vars['cache']
-    if i >= 16:
-      data_in[:, i + 1:i + 2] = updates[:]  # greedy sampling
-
-  return data_in[0]
-
-
-
 def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
   config = T5Config()
-
-  # Load data
-  train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
-      n_devices=jax.local_device_count(), config=config, vocab_path=None)
-  lm1b_gen = data_generator(train_ds)
-
-  state, model = train_loop(config, 1000, lm1b_gen)
+  state, model = train_loop(config)
 
 
 if __name__ == '__main__':

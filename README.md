@@ -3,8 +3,14 @@ ADHD
 
 Attention modeling for those without it.
 
-Not yet functional.
-====================
+- Really basic training loop on LM1B and inline inference / decoding "works".
+- Absolutely nothing is tuned.
 
-train.py not yet fixed to use modern flax metadata calls.
-
+TODO
+====
+ - What decoder model variant do we actually want?
+ - Multihost data-loading and training (from sholto's library.)
+ - More flexible demo prompting / simple batch inference script.
+ - Prefix-LM support for input->target datasets.
+ - Should we use CLU metric helpers or hand-roll that stuff?
+ - We have simple tf.data pipeline, but should we use SeqIO? Grain? an outside library?
