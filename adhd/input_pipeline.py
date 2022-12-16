@@ -3,7 +3,6 @@
 import os
 from typing import Dict, Optional, List, Union
 
-from clu import deterministic_data
 import ml_collections
 import tensorflow as tf
 import tensorflow_datasets as tfds
@@ -38,8 +37,9 @@ def get_raw_dataset(dataset_builder: tfds.core.DatasetBuilder,
     Dataset with source and target language features mapped to 'inputs' and
     'targets'.
   """
-  per_host_split = tfds.split_for_jax_process(split, drop_remainder=False)
-  ds = dataset_builder.as_dataset(split=per_host_split, shuffle_files=False)
+  # per_host_split = tfds.split_for_jax_process(split, drop_remainder=False)
+  # ds = dataset_builder.as_dataset(split=per_host_split, shuffle_files=False)
+  ds = dataset_builder.as_dataset(split=split, shuffle_files=False)
   ds = ds.map(
       NormalizeFeatureNamesOp(dataset_builder.info),
       num_parallel_calls=AUTOTUNE)
@@ -230,15 +230,17 @@ def _pack_with_tf_ops(dataset: tf.data.Dataset, keys: List[str],
 # -----------------------------------------------------------------------------
 # Main dataset prep routines.
 # -----------------------------------------------------------------------------
-def preprocess_data(dataset,
-                    shuffle: bool,
-                    num_epochs: Optional[int] = 1,
-                    pack_examples: bool = True,
-                    shuffle_buffer_size: int = 1024,
-                    max_length: int = 512,
-                    batch_size: int = 256,
-                    drop_remainder: bool = True,
-                    prefetch_size: int = AUTOTUNE):
+def preprocess_data(
+  dataset,
+  shuffle: bool,
+  num_epochs: Optional[int] = 1,
+  pack_examples: bool = True,
+  shuffle_buffer_size: int = 1024,
+  max_length: int = 512,
+  # batch_size: int = 256,
+  # drop_remainder: bool = True,
+  # prefetch_size: int = AUTOTUNE
+):
   """Shuffle and batch/pack the given dataset."""
 
   def length_filter(max_len):
@@ -259,30 +261,32 @@ def preprocess_data(dataset,
 
   if pack_examples:
     dataset = pack_dataset(dataset, max_length)
-    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
-  else:  # simple (static-shape) padded batching
-    dataset = dataset.padded_batch(
-        batch_size,
-        padded_shapes={
-            'inputs': max_length,
-            'targets': max_length
-        },
-        padding_values={
-            'inputs': 0,
-            'targets': 0
-        },
-        drop_remainder=drop_remainder)
+  #   dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
+  # else:  # simple (static-shape) padded batching
+  #   dataset = dataset.padded_batch(
+  #       batch_size,
+  #       padded_shapes={
+  #           'inputs': max_length,
+  #           'targets': max_length
+  #       },
+  #       padding_values={
+  #           'inputs': 0,
+  #           'targets': 0
+  #       },
+  #       drop_remainder=drop_remainder)
 
-  if prefetch_size:
-    dataset = dataset.prefetch(prefetch_size)
+  # if prefetch_size:
+  #   dataset = dataset.prefetch(prefetch_size)
 
   return dataset
 
 
-def get_datasets(config: ml_collections.ConfigDict,
-                 *,
-                 n_devices: int,
-                 vocab_path: Optional[str] = None):
+def get_datasets(
+  config: ml_collections.ConfigDict,
+  *,
+  n_devices: int,
+  vocab_path: Optional[str] = None
+):
   """Load and return dataset of batched examples for use during training."""
   if vocab_path is None:
     vocab_path = os.path.expanduser('~/lm1b_sentencepiece_model')
@@ -307,33 +311,33 @@ def get_datasets(config: ml_collections.ConfigDict,
   eval_data = eval_data.map(
       tokenizer.TokenizeOp(sp_tokenizer), num_parallel_calls=AUTOTUNE)
 
-  batch_size = config.per_device_batch_size * n_devices
-  if config.eval_per_device_batch_size > 0:
-    eval_batch_size = config.eval_per_device_batch_size * n_devices
-  else:
-    eval_batch_size = batch_size
+  # batch_size = config.per_device_batch_size * n_devices
+  # if config.eval_per_device_batch_size > 0:
+  #   eval_batch_size = config.eval_per_device_batch_size * n_devices
+  # else:
+  #   eval_batch_size = batch_size
 
   train_ds = preprocess_data(
       train_data,
       shuffle=True,
       num_epochs=None,
       pack_examples=True,
-      batch_size=batch_size,
+      # batch_size=batch_size,
       max_length=config.max_target_length)
 
   eval_ds = preprocess_data(
       eval_data,
       shuffle=False,
       pack_examples=False,
-      batch_size=eval_batch_size,
+      # batch_size=eval_batch_size,
       max_length=config.max_eval_target_length)
 
   predict_ds = preprocess_data(
       eval_data,
       shuffle=False,
       pack_examples=False,
-      batch_size=eval_batch_size,
-      max_length=config.max_predict_length,
-      drop_remainder=False)
+      # batch_size=eval_batch_size,
+      max_length=config.max_predict_length)
+      #drop_remainder=False)
 
   return train_ds, eval_ds, predict_ds, sp_tokenizer

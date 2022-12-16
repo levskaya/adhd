@@ -27,12 +27,13 @@ class T5Config:
   param_scan_axis: int = 1
 
   # Parallelism
-  mesh_shape: Tuple[int] = (8,)
+  mesh_shape: Tuple[int] = (32,)
   mesh_axes: Tuple[str] = ('data',)
   logical_axis_rules: Sequence = ( ('batch', 'data'), )
 
   # Dataset
   vocab_size: int = 30000
+  vocab_path: str = "gs://levskaya-tpu-data/vocabs/vocab"
   dataset_name: str = 'lm1b'
   eval_dataset_name: str = 'lm1b'
   eval_split: str = 'test'

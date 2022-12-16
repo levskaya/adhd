@@ -15,6 +15,7 @@ from jax import lax
 from jax import random
 import numpy as np
 import optax
+import tensorflow as tf
 
 from jax.experimental.pjit import pjit
 from jax.experimental.pjit import PartitionSpec as P
@@ -25,6 +26,8 @@ from layers import Transformer
 from config import T5Config
 from input_pipeline import get_datasets
 import temperature_sampler
+import multihost_dataloading
+
 
 # -----------------------------------------------------------------------------
 # Types
@@ -55,31 +58,34 @@ class MutableTrainState(train_state.TrainState):
 # -----------------------------------------------------------------------------
 
 # A generator should return (input, target, segments, positions)
-def shift_right(x, axis=1):
-  """Shift the input to the right by padding and slicing on axis."""
-  pad_widths = [(0, 0)] * len(x.shape)
-  pad_widths[axis] = (1, 0)
-  slices = [slice(None),] * x.ndim
-  slices[axis] = slice(0, -1)
-  padded = np.pad(
-      x, pad_widths, mode='constant', constant_values=x.dtype.type(0))
-  return padded[tuple(slices)]
+# def shift_right(x, axis=1):
+#   """Shift the input to the right by padding and slicing on axis."""
+#   pad_widths = [(0, 0)] * len(x.shape)
+#   pad_widths[axis] = (1, 0)
+#   slices = [slice(None),] * x.ndim
+#   slices[axis] = slice(0, -1)
+#   padded = np.pad(
+#       x, pad_widths, mode='constant', constant_values=x.dtype.type(0))
+#   return padded[tuple(slices)]
 
-def shift_inputs(x, segment_ids=None, axis=1):
-  """Shift inputs and replace EOS by 0 for packed inputs."""
-  shifted = shift_right(x, axis=axis)
-  # For packed targets, the first shifted token of a new sequence is made
-  # 0, rather than being the EOS token for the last sequence.
-  if segment_ids is not None:
-    shifted *= (segment_ids == shift_right(segment_ids, axis=axis))
-  return shifted
+# def shift_inputs(x, segment_ids=None, axis=1):
+#   """Shift inputs and replace EOS by 0 for packed inputs."""
+#   shifted = shift_right(x, axis=axis)
+#   # For packed targets, the first shifted token of a new sequence is made
+#   # 0, rather than being the EOS token for the last sequence.
+#   if segment_ids is not None:
+#     shifted *= (segment_ids == shift_right(segment_ids, axis=axis))
+#   return shifted
 
-def data_generator(train_ds):
-  train_iter = iter(train_ds)
+
+def data_generator(data_gen):
+  # train_iter = iter(train_ds)
   while True:
-    data = jax.tree_util.tree_map(np.asarray, next(train_iter))
+    # data = jax.tree_util.tree_map(np.asarray, next(data_gen))
+    data = next(data_gen)
     yield (
-      shift_inputs(data['inputs'], data['inputs_segmentation']),
+      # shift_inputs(data['inputs'], data['inputs_segmentation']),
+      data['inputs'],
       data['inputs'],
       data['inputs_segmentation'],
       data['inputs_position']
@@ -225,13 +231,6 @@ def train_loop(
   # Initial PRNG Keys
   init_rng, nextrng = random.split(random.PRNGKey(0), 2)
 
-  # Set up datasets.
-  train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
-      n_devices=jax.local_device_count(),
-      config=config,
-      vocab_path=None)
-  data_gen = data_generator(train_ds)
-
   # Model and Optimizer definition
   model = Transformer(config)
   tx = optax.adam(
@@ -261,7 +260,7 @@ def train_loop(
   if config.restore_checkpoints:
     state = checkpoints.restore_checkpoint(ckpt_path, state)
 
-  data_pspec = nn.logical_to_mesh(P('batch'))
+  data_pspec = P('data', None)
 
   p_train_step = pjit(
     train_step,
@@ -275,11 +274,42 @@ def train_loop(
 
   p_predict_step = pjit(
       functools.partial(predict_step, model=model, config=config),
-      in_axis_resources=(data_pspec,
+      in_axis_resources=(P(None, None),
                         state_mesh_annotations,
                         None),
       out_axis_resources=None
   )
+
+
+  # Set up datasets.
+  train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
+      n_devices=jax.local_device_count(),
+      config=config,
+      vocab_path=config.vocab_path)
+
+  print("Loaded!")
+
+  def batch_fn(ds, batch_size):
+    return ds.repeat().batch(batch_size, drop_remainder=True).prefetch(tf.data.experimental.AUTOTUNE)
+
+  batch_size = len(jax.devices()) * config.per_device_batch_size
+  global_shape = P(batch_size, config.max_target_length)
+  data_pspec = P('data', None)
+
+  data_gen = multihost_dataloading.get_per_host_data_pipeline(
+    train_ds,
+    {'inputs': global_shape, 'inputs_segmentation': global_shape, 'inputs_position': global_shape,
+     'targets': global_shape, 'targets_segmentation': global_shape, 'targets_position': global_shape},
+    mesh,
+    {'inputs': data_pspec, 'inputs_segmentation': data_pspec, 'inputs_position': data_pspec,
+     'targets': data_pspec, 'targets_segmentation': data_pspec, 'targets_position': data_pspec},
+    batch_fn)
+
+  print("Multihosted!")
+
+  data_gen = data_generator(data_gen)
+
+  print("Shifted!")
 
   # Prediction helpers.
 
@@ -310,7 +340,7 @@ def train_loop(
       print(step, metrics)
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         seqs = p_predict_step(tokenized_prompts, state, nextrng)
-        print(decode_tokens(seqs[0]))
+        print(decode_tokens(np.array(seqs)[0]))
 
     if step % config.save_period == 0:
       if config.save_checkpoints and step != 0:
