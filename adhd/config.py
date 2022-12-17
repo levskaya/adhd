@@ -33,7 +33,7 @@ class T5Config:
 
   # Dataset
   vocab_size: int = 30000
-  vocab_path: str = "gs://levskaya-tpu-data/vocabs/vocab"
+  vocab_path: str = "gs://levskaya-tpu-data/vocabs/vocab"  # NOT PUBLIC, PICK YOUR OWN
   dataset_name: str = 'lm1b'
   eval_dataset_name: str = 'lm1b'
   eval_split: str = 'test'
@@ -43,7 +43,7 @@ class T5Config:
 
   # Training loop
   steps: int = 20_000
-  log_period: int = 50 # 500
+  log_period: int = 500
   save_period: int = 2000
   learning_rate: float = 1e-3
   warmup_steps: int = 1000
