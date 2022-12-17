@@ -1044,24 +1044,6 @@ class Decoder(nn.Module):
     return logits
 
 
-def shift_right(x, axis=1):
-  """Shift the input to the right by padding and slicing on axis."""
-  pad_widths = [(0, 0)] * len(x.shape)
-  pad_widths[axis] = (1, 0)
-  padded = jnp.pad(
-      x, pad_widths, mode='constant', constant_values=x.dtype.type(0))
-  return lax.dynamic_slice_in_dim(padded, 0, padded.shape[axis] - 1, axis)
-
-
-def shift_inputs(x, segment_ids=None, axis=1):
-  """Shift inputs and replace EOS by 0 for packed inputs."""
-  shifted = shift_right(x, axis=axis)
-  # For packed targets, the first shifted token of a new sequence is made
-  # 0, rather than being the EOS token for the last sequence.
-  if segment_ids is not None:
-    shifted *= (segment_ids == shift_right(segment_ids, axis=axis))
-  return shifted
-
 class Transformer(nn.Module):
   """An decoder-only Transformer model."""
   config: Config
@@ -1090,12 +1072,6 @@ class Transformer(nn.Module):
       max_decode_length=None):
     """Applies Transformer decoder-branch on encoded-input and target."""
     cfg = self.config
-
-    # HACK: this belongs in the data loader before tokens are moved to device.
-    # if not decode:
-    #   decoder_input_tokens = shift_inputs(decoder_input_tokens,
-    #                                       segment_ids=decoder_segment_ids,
-    #                                       axis=1)
 
     # Make padding attention masks.
     if decode:

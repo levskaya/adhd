@@ -1,3 +1,9 @@
+"""SPMD Multihost Dataloading Utilities.
+
+Adapted from Sholto's:
+https://github.com/sholtodouglas/multihost_dataloading
+"""
+
 from collections import defaultdict  # pylint: disable=g-importing-member
 from dataclasses import dataclass  # pylint: disable=g-importing-member
 from functools import partial  # pylint: disable=g-importing-member
@@ -7,22 +13,18 @@ from typing import Callable, Any, Dict, List, Tuple, Optional
 import jax
 from jax.experimental import global_device_array as gda_lib
 from jax.experimental import PartitionSpec
-# from jax.experimental.global_device_array import GlobalDeviceArray
 from jax.experimental.maps import Mesh
 from jax.experimental.pjit import pjit
 from jax.experimental.pjit import with_sharding_constraint
 import numpy as np
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # disable CUDA not found etc warnings
 import tensorflow as tf  # pylint: disable=g-import-not-at-top
 
-# make pjit output GDAs
-# jax.config.update('jax_parallel_functions_output_gda', True)
 
 Pytree = Any
 Device = Any
 
-data_dim = 0  # assume data dimension is the first
+
+DATA_DIM = 0  # assume data dimension is the first
 
 
 # Per host data pipeline
@@ -81,7 +83,7 @@ def convert_global_indices_to_local_indices(
   local_indices = [device_to_index[device] for device in jax.local_devices()]
   # Tacit assumption that we -only- shard dataset batch along data dim here, we could
   # relax this but I'm not sure it would actually be handled right by this approach:
-  data_indices = [(s[data_dim].start, s[data_dim].stop) for s in local_indices]
+  data_indices = [(s[DATA_DIM].start, s[DATA_DIM].stop) for s in local_indices]
   unique_slice_sizes = {idx: idx[1]-idx[0] for idx in data_indices}
 
   # assign a unique local data slice to each device
@@ -111,7 +113,7 @@ def get_next_per_host(
   # this is returned as a pytree in the same shape as global data shape
 
   # Slice this up using local indices and give it to the host local devices
-  def form_gda(element, shape, axes) -> jax.Array:
+  def create_distributed_array(element, shape, axes) -> jax.Array:
     device_buffers = []
     for device in jax.local_devices():
       local_indices = host_local_indices[device]
@@ -120,8 +122,8 @@ def get_next_per_host(
     return jax.make_array_from_single_device_arrays(
         shape, jax.sharding.NamedSharding(global_mesh, axes), device_buffers)
 
-  return (jax.tree_map(form_gda, x, global_data_shape, data_axes) for x in sharded_dataset)
-
+  return (jax.tree_map(create_distributed_array, x, global_data_shape, data_axes)
+          for x in sharded_dataset)
 
 
 def get_per_host_data_pipeline(
@@ -181,19 +183,17 @@ def get_per_host_data_pipeline(
 
   # Create the data pipeline
   local_data_shard_index = host_to_dataset_shard[jax.process_index()]
-  dataset = dataset.shard(num_shards=num_shards, index=local_data_shard_index)
 
-  if batching_fn:
-      dataset = batching_fn(dataset, total_data_to_load)
-  else:
-      dataset = dataset.batch(total_data_to_load).repeat()
+  def multihost_shard_fn(dataset):
+      return dataset.shard(num_shards=num_shards, index=local_data_shard_index)
 
-  sharded_dataset = iter(dataset.as_numpy_iterator())
+  def multihost_generator(sharded_dataset):
+    return get_next_per_host(
+        sharded_dataset,
+        host_local_indices,
+        global_data_shape,
+        global_mesh,
+        data_axes
+    )
 
-  return get_next_per_host(
-      sharded_dataset,
-      host_local_indices,
-      global_data_shape,
-      global_mesh,
-      data_axes
-  )
+  return multihost_shard_fn, multihost_generator
