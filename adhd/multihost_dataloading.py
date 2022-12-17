@@ -30,8 +30,8 @@ data_dim = 0  # assume data dimension is the first
 
 
 def check_inputs(dataset, global_data_shape, data_axes):
-  # TODO(sholto): Is there a way to do this without calling dataset?
-  dataset_structure = jax.tree_util.tree_structure(iter(dataset).next())
+  # dataset_structure = jax.tree_util.tree_structure(iter(dataset).next())
+  dataset_structure = jax.tree_util.tree_structure(tf.data.experimental.get_structure(dataset))
   global_data_shape_structure = jax.tree_util.tree_structure(global_data_shape)
   data_axes_structure = jax.tree_util.tree_structure(data_axes)
   try:
@@ -47,7 +47,6 @@ def check_inputs(dataset, global_data_shape, data_axes):
   assert all(b == batch_dims[0]for b in batch_dims), 'All batch axis should be equal for gdas'
   assert all(b[0] == shapes[0][0] for b in shapes), 'All dataset elements should be sharded along the data axis identically'
   batch_dim = batch_dims[0]
-  print(f"{batch_dim=}")
   return batch_dim
 
 
@@ -82,7 +81,6 @@ def convert_global_indices_to_local_indices(
   local_indices = [device_to_index[device] for device in jax.local_devices()]
   # Tacit assumption that we -only- shard dataset batch along data dim here, we could
   # relax this but I'm not sure it would actually be handled right by this approach:
-  print(f"{local_indices=}")
   data_indices = [(s[data_dim].start, s[data_dim].stop) for s in local_indices]
   unique_slice_sizes = {idx: idx[1]-idx[0] for idx in data_indices}
 
@@ -119,14 +117,8 @@ def get_next_per_host(
       local_indices = host_local_indices[device]
       data = element[local_indices]
       device_buffers.append(jax.device_put(data, device))
-    # return GlobalDeviceArray(shape, global_mesh, axes, device_buffers)
     return jax.make_array_from_single_device_arrays(
-        shape, jax.sharding.MeshPspecSharding(global_mesh, axes), device_buffers)
-
-  # local_data = sharded_dataset.next()
-  #  pytree_of_gdas = jax.tree_map(
-  #      form_gda, local_data, global_data_shape, data_axes)
-  #  return pytree_of_gdas
+        shape, jax.sharding.NamedSharding(global_mesh, axes), device_buffers)
 
   return (jax.tree_map(form_gda, x, global_data_shape, data_axes) for x in sharded_dataset)
 
@@ -163,8 +155,6 @@ def get_per_host_data_pipeline(
     lambda shape, axes: gda_lib.get_shard_indices(shape, global_mesh, axes),
     global_data_shape,
     data_axes)
-
-  print(f"{device_to_index=}")
 
   # group by host_id
   host_to_devices = defaultdict(list)
@@ -207,13 +197,3 @@ def get_per_host_data_pipeline(
       global_mesh,
       data_axes
   )
-
-#   next_fn = partial(
-#       get_next_per_host,
-#       sharded_dataset,
-#       host_local_indices,
-#       global_data_shape,
-#       global_mesh,
-#       data_axes,
-#   )
-#   return next_fn

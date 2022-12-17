@@ -230,6 +230,36 @@ def _pack_with_tf_ops(dataset: tf.data.Dataset, keys: List[str],
 # -----------------------------------------------------------------------------
 # Main dataset prep routines.
 # -----------------------------------------------------------------------------
+def shift_right_tf(x, axis=1):
+  """Shift the input to the right by padding and slicing on axis."""
+  pad_widths = [(0, 0)] * len(x.shape)
+  pad_widths[axis] = (1, 0)
+  slices = [slice(None),] * len(x.shape)
+  slices[axis] = slice(0, -1)
+  padded = tf.pad(
+      x,
+      tf.constant(pad_widths),
+      mode='constant',
+      constant_values=tf.constant(0, x.dtype))
+  return padded[tuple(slices)]
+
+
+def shift_inputs_tf(x, segment_ids=None, axis=1):
+  """Shift inputs and replace EOS by 0 for packed inputs."""
+  shifted = shift_right_tf(x, axis=axis)
+  # For packed targets, the first shifted token of a new sequence is made
+  # 0, rather than being the EOS token for the last sequence.
+  if segment_ids is not None:
+    shifted *= tf.cast(segment_ids == shift_right_tf(segment_ids, axis=axis), x.dtype)
+  return shifted
+
+
+def shift_data(x, axis=0):
+  # segment_ids = x['inputs_segmentation'] if 'inputs_segmentation' in x else None
+  x['inputs'] = shift_inputs_tf(x['inputs'], segment_ids=x['inputs_segmentation'], axis=axis)
+  return x
+
+
 def preprocess_data(
   dataset,
   shuffle: bool,
@@ -237,9 +267,7 @@ def preprocess_data(
   pack_examples: bool = True,
   shuffle_buffer_size: int = 1024,
   max_length: int = 512,
-  # batch_size: int = 256,
-  # drop_remainder: bool = True,
-  # prefetch_size: int = AUTOTUNE
+  shift: bool = True
 ):
   """Shuffle and batch/pack the given dataset."""
 
@@ -275,6 +303,12 @@ def preprocess_data(
   #       },
   #       drop_remainder=drop_remainder)
 
+  if shift:
+    dataset = dataset.map(
+      shift_data,
+      num_parallel_calls=tf.data.AUTOTUNE,
+      deterministic=True)
+
   # if prefetch_size:
   #   dataset = dataset.prefetch(prefetch_size)
 
@@ -284,7 +318,6 @@ def preprocess_data(
 def get_datasets(
   config: ml_collections.ConfigDict,
   *,
-  n_devices: int,
   vocab_path: Optional[str] = None
 ):
   """Load and return dataset of batched examples for use during training."""
@@ -323,21 +356,24 @@ def get_datasets(
       num_epochs=None,
       pack_examples=True,
       # batch_size=batch_size,
-      max_length=config.max_target_length)
+      max_length=config.max_target_length,
+      shift=True)
 
   eval_ds = preprocess_data(
       eval_data,
       shuffle=False,
       pack_examples=False,
       # batch_size=eval_batch_size,
-      max_length=config.max_eval_target_length)
+      max_length=config.max_eval_target_length,
+      shift=False)
 
   predict_ds = preprocess_data(
       eval_data,
       shuffle=False,
       pack_examples=False,
       # batch_size=eval_batch_size,
-      max_length=config.max_predict_length)
+      max_length=config.max_predict_length,
+      shift=False)
       #drop_remainder=False)
 
   return train_ds, eval_ds, predict_ds, sp_tokenizer

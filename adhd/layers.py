@@ -1091,10 +1091,12 @@ class Transformer(nn.Module):
     """Applies Transformer decoder-branch on encoded-input and target."""
     cfg = self.config
 
-    if not decode:
-      decoder_input_tokens = shift_inputs(decoder_input_tokens,
-                                          segment_ids=decoder_segment_ids,
-                                          axis=1)
+    # HACK: this belongs in the data loader before tokens are moved to device.
+    # if not decode:
+    #   decoder_input_tokens = shift_inputs(decoder_input_tokens,
+    #                                       segment_ids=decoder_segment_ids,
+    #                                       axis=1)
+
     # Make padding attention masks.
     if decode:
       # Do not mask decoder attention based on targets padding at

@@ -86,13 +86,13 @@ def data_generator(data_gen):
     yield (
       # shift_inputs(data['inputs'], data['inputs_segmentation']),
       data['inputs'],
-      data['inputs'],
+      data['targets'],
       data['inputs_segmentation'],
       data['inputs_position']
     )
 
 
-# Helpers
+# Learning Rate Schedule
 # -----------------------------------------------------------------------------
 
 # learning rate scheduling
@@ -280,29 +280,27 @@ def train_loop(
       out_axis_resources=None
   )
 
-
   # Set up datasets.
-  train_ds, eval_ds, predict_ds, sp_tokenizer = get_datasets(
-      n_devices=jax.local_device_count(),
+  train_ds, _, _, sp_tokenizer = get_datasets(
       config=config,
       vocab_path=config.vocab_path)
 
   print("Loaded!")
 
-  def batch_fn(ds, batch_size):
-    return ds.repeat().batch(batch_size, drop_remainder=True).prefetch(tf.data.experimental.AUTOTUNE)
-
   batch_size = len(jax.devices()) * config.per_device_batch_size
   global_shape = P(batch_size, config.max_target_length)
   data_pspec = P('data', None)
+  data_keys = ('inputs', 'inputs_segmentation', 'inputs_position',
+               'targets', 'targets_segmentation', 'targets_position')
+
+  def batch_fn(ds, batch_size):
+    return ds.repeat().batch(batch_size, drop_remainder=True).prefetch(tf.data.experimental.AUTOTUNE)
 
   data_gen = multihost_dataloading.get_per_host_data_pipeline(
     train_ds,
-    {'inputs': global_shape, 'inputs_segmentation': global_shape, 'inputs_position': global_shape,
-     'targets': global_shape, 'targets_segmentation': global_shape, 'targets_position': global_shape},
+    {k: global_shape for k in data_keys},
     mesh,
-    {'inputs': data_pspec, 'inputs_segmentation': data_pspec, 'inputs_position': data_pspec,
-     'targets': data_pspec, 'targets_segmentation': data_pspec, 'targets_position': data_pspec},
+    {k: data_pspec for k in data_keys},
     batch_fn)
 
   print("Multihosted!")
